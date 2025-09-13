@@ -1,0 +1,6 @@
+packages:
+  - "frontend"
+  - "my-app"
+  - "contracts"
+  - "circuits"
+  - "packages/*"

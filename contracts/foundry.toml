@@ -1,0 +1,8 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+
+[rpc_endpoints]
+sepolia = "https://ethereum-sepolia.g.allthatnode.com/full/evm/37db3da740e6491aaa9511b1ed645a45"
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

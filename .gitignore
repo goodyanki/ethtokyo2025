@@ -1,0 +1,29 @@
+# Node / Next.js
+node_modules/
+.pnpm-store/
+.next/
+dist/
+out/
+*.log
+
+# Env
+.env
+.env.local
+apps/**/.env*
+
+# Foundry
+contracts/cache/
+contracts/out/
+broadcast/
+
+# Circuits / zk
+circuits/build/
+circuits/ptau/
+*.r1cs
+*.zkey
+*.ptau
+*.wasm
+*.sym
+
+# Misc
+.DS_Store
