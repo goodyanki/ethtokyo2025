@@ -1,90 +1,70 @@
-# mpc/server.py
-from fastapi import FastAPI
-import sqlite3
-from typing import List, Dict, Any
-from fastapi.middleware.cors import CORSMiddleware
+# 方案1: 修改后端直接调用合约
+# mpc/server.py 的 sender_announce 函数
 
+import os
+from web3 import Web3
+import json
 
-DB_PATH = "mpc_index.db"
+# 在文件顶部添加
+RPC_URL = os.getenv("RPC_URL", "http://127.0.0.1:8545")
+REGISTRY_ADDRESS = os.getenv("REGISTRY_V2")  # StealthRegistry 合约地址
+PRIVATE_KEY = os.getenv("SENDER_PRIVATE_KEY")  # 发送交易的私钥
 
-app = FastAPI(title="MPC Wallet Server")
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
 
-def fetch_inbox(user_id: str) -> List[Dict[str, Any]]:
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("""
-    SELECT i.id, e.block, e.txhash, hex(e.tag), hex(e.R), hex(e.memo), hex(e.commitment), i.status
-    FROM inbox i
-    JOIN events e ON i.event_id = e.id
-    WHERE i.user_id=?
-    ORDER BY i.detected_at DESC
-    """, (user_id,))
-    rows = cur.fetchall()
-    con.close()
-    results = []
-    for row in rows:
-        iid, blk, tx, tag_hex, R_hex, memo_hex, commit_hex, status = row
-        results.append({
-            "inbox_id": iid,
-            "block": blk,
-            "txhash": tx,
-            "tag": tag_hex,
-            "R": R_hex,
-            "memo": memo_hex,
-            "commitment": commit_hex,
-            "status": status,
+# 加载 StealthRegistry ABI
+with open("../contracts/out/StealthRegistry.sol/StealthRegistryV2.json") as f:
+    registry_abi = json.load(f)["abi"]
+
+@app.post("/sender/announce")
+def sender_announce(request: AnnounceRequest):
+    """
+    接收发送方的公告请求，真实发布到链上
+    """
+    try:
+        if not REGISTRY_ADDRESS:
+            return {"ok": False, "error": "合约地址未配置"}
+            
+        # 创建合约实例
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(REGISTRY_ADDRESS), 
+            abi=registry_abi
+        )
+        
+        # 准备参数
+        R_bytes = bytes.fromhex(request.R[2:] if request.R.startswith('0x') else request.R)
+        tag_bytes32 = bytes.fromhex(request.tag[2:] if request.tag.startswith('0x') else request.tag)
+        commitment_bytes32 = bytes.fromhex(request.commitment[2:] if request.commitment.startswith('0x') else request.commitment)
+        memo_bytes = b""  # 暂时为空
+        
+        # 构建交易
+        account = w3.eth.account.from_key(PRIVATE_KEY)
+        
+        # 调用 publish 方法
+        tx = contract.functions.publish(
+            R_bytes,
+            memo_bytes, 
+            commitment_bytes32,
+            tag_bytes32
+        ).build_transaction({
+            'from': account.address,
+            'nonce': w3.eth.get_transaction_count(account.address),
+            'gas': 200000,
+            'gasPrice': w3.to_wei('10', 'gwei')
         })
-    return results
-
-@app.get("/wallet/sync")
-def wallet_sync(user_id: str = "alice"):
-    """
-    拉取用户收件箱中的交易（已经通过 scanner 命中的）
-    """
-    inbox = fetch_inbox(user_id)
-    return {"user": user_id, "inbox": inbox}
-
-@app.post("/wallet/decrypt")
-def wallet_decrypt(inbox_id: int, user_id: str = "alice"):
-    """
-    演示解密：真实情况应使用 view 私钥协作解密 ECIES 密文。
-    这里先 mock，返回 memo 里存的 hex。
-    """
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("""
-    SELECT e.memo
-    FROM inbox i JOIN events e ON i.event_id = e.id
-    WHERE i.id=? AND i.user_id=?
-    """, (inbox_id, user_id))
-    row = cur.fetchone(); con.close()
-    if not row:
-        return {"ok": False, "error": "not found"}
-    memo_hex = row[0].hex()
-    # TODO: 替换为真正的 ECIES 解密
-    return {"ok": True, "plaintext": memo_hex}
-
-@app.post("/stealth/spend")
-def stealth_spend(inbox_id: int, to: str, amount: int, user_id: str = "alice"):
-    """
-    演示花费：真实情况应使用 TSS ECDSA 对交易签名并广播。
-    这里先 mock，返回一个虚拟 txid。
-    """
-    # TODO: 接入 TSS 模块，构造 raw tx，并用阈值签名
-    fake_txid = f"0xDEMOFAKETX{inbox_id:04d}"
-    return {"ok": True, "txid": fake_txid, "to": to, "amount": amount}
-
-origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,  # 或 ["*"] 直接全开
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/health")
-def health():
-    return {"ok": True}
+        
+        # 签名并发送
+        signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+        
+        return {
+            "ok": True,
+            "message": "公告已上链",
+            "txHash": receipt.transactionHash.hex(),
+            "blockNumber": receipt.blockNumber
+        }
+        
+    except Exception as e:
+        print(f"上链失败: {e}")
+        return {"ok": False, "error": str(e)}
