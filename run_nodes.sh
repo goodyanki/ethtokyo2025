@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 用法：
-#   1) 从基础地址推导 view_sk：
-#      ./run_nodes.sh --base-addr 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
-#   2) 或直接传入 view_sk（32字节hex）：
-#      ./run_nodes.sh --view-sk 0x<64-hex>
-#
-# 依赖：python3、fastapi、uvicorn、coincurve、web3
-# 安装：pip install fastapi uvicorn coincurve web3
-
 BASE_ADDR=""
 VIEW_SK=""
 HOST="127.0.0.1"
@@ -17,6 +8,7 @@ P1=7001; P2=7002; P3=7003
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+# 参数解析
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base-addr) BASE_ADDR="${2:-}"; shift 2 ;;
@@ -33,12 +25,8 @@ done
 [[ -n "$BASE_ADDR" && -n "$VIEW_SK" ]] && die "pass only one of --view-sk or --base-addr"
 [[ -f "mpc/node_scan.py" ]] || die "mpc/node_scan.py not found (run from repo root)"
 
-# 生成 shares 的临时文件
+# 生成 shares
 TMPFILE="$(mktemp -t mpcshares.XXXXXX)"
-cleanup() { rm -f "$TMPFILE"; }
-trap cleanup EXIT
-
-# 用 Python 派生 view_sk（如果传 base-addr）并做 2-of-3 Shamir
 python3 - "$BASE_ADDR" "$VIEW_SK" > "$TMPFILE" <<'PY'
 import sys, secrets
 from web3 import Web3
@@ -46,7 +34,7 @@ N = int("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16
 
 def derive_view_sk_from_addr(addr: str) -> int:
     addr = addr.strip()
-    if not addr.startswith(("0x","0X")) or len(addr) != 42:
+    if not (addr.startswith(("0x","0X")) and len(addr)==42):
         raise SystemExit("invalid base address")
     seed = Web3.keccak(text=addr.lower() + ":view")
     x = int.from_bytes(seed, "big")
@@ -72,7 +60,6 @@ for i, y in shares:
     print(f"{i}:0x{y:064x}")
 PY
 
-# 解析输出
 S1=""; S2=""; S3=""
 while IFS= read -r line; do
   case "$line" in
@@ -81,39 +68,58 @@ while IFS= read -r line; do
     3:*) S3="${line#*:}";;
   esac
 done < "$TMPFILE"
+rm -f "$TMPFILE"
 
-[[ -z "$S1" || -z "$S2" || -z "$S3" ]] && die "failed to parse shares (check python deps and inputs)"
+for n in 1 2 3; do
+  v="$(eval echo \$S$n)"
+  [[ -z "$v" ]] && die "failed to parse share $n"
+  [[ "${v:0:2}" != "0x" || "${#v}" -ne 66 ]] && die "share $n bad format (expect 0x + 64 hex), got: $v"
+done
 
 echo "== Derived 2-of-3 shares =="
-echo "  1: $S1"
-echo "  2: $S2"
-echo "  3: $S3"
+echo "  1: ${S1:0:6}... (len=${#S1})"
+echo "  2: ${S2:0:6}... (len=${#S2})"
+echo "  3: ${S3:0:6}... (len=${#S3})"
 echo
 
-# 先杀掉旧的 uvicorn 节点（如果有）
+# 清理旧进程
 pkill -f "uvicorn mpc.node_scan:app" >/dev/null 2>&1 || true
 
 start_node () {
   local idx="$1" share="$2" port="$3"
-  NODE_INDEX="$idx" VIEW_SK_SHARE_HEX="$share" \
-    python3 -m uvicorn mpc.node_scan:app --host "$HOST" --port "$port" --reload \
-    > "node${idx}.log" 2>&1 &
-  echo "node #$idx started at http://${HOST}:${port} (log: node${idx}.log)"
+  NODE_INDEX="$idx" VIEW_SK_SHARE_HEX="$share" PYTHONPATH="$PWD" \
+    python3 -m uvicorn mpc.node_scan:app \
+      --host "$HOST" --port "$port" --no-access-log --log-level warning \
+      > "node${idx}.log" 2>&1 &
+  echo "node #$idx starting at http://${HOST}:${port} (log: node${idx}.log)"
 }
 
 start_node 1 "$S1" "$P1"
 start_node 2 "$S2" "$P2"
 start_node 3 "$S3" "$P3"
 
+# 健康检查
+check_health () {
+  local port="$1" name="$2"
+  for _ in {1..10}; do
+    if curl -s "http://${HOST}:${port}/health" | grep -q '"ok":true'; then
+      echo "✅ $name healthy on :$port"; return 0
+    fi
+    sleep 0.5
+  done
+  echo "❌ $name not healthy on :$port. See node${name#node }.log"; return 1
+}
+
+ok=0
+check_health "$P1" "node1" && ok=$((ok+1)) || true
+check_health "$P2" "node2" && ok=$((ok+1)) || true
+check_health "$P3" "node3" && ok=$((ok+1)) || true
+[[ $ok -lt 3 ]] && { echo "Some nodes failed. Tail logs with: tail -n 200 node1.log node2.log node3.log"; exit 1; }
+
 echo
-echo "✅ All nodes started."
-echo "Check:"
-echo "  curl http://${HOST}:${P1}/health"
-echo "  curl http://${HOST}:${P2}/health"
-echo "  curl http://${HOST}:${P3}/health"
-echo
+echo "✅ All nodes healthy."
 echo "Run scanner with:"
 echo "  export USE_MPC=true"
 echo "  export MPC_NODES=\"http://${HOST}:${P1},http://${HOST}:${P2},http://${HOST}:${P3}\""
 echo "  export MPC_THRESHOLD=2"
-echo "  python mpc/scanner.py"
+echo "  python3 mpc/scanner.py"

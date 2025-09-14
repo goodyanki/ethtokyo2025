@@ -1,217 +1,272 @@
 # mpc/watcher.py
+# -*- coding: utf-8 -*-
 import os, json, sqlite3, time
 from web3 import Web3
 from web3._utils.events import get_event_data
 
+# -------------------- .env 加载（优先 python-dotenv；无则用内置解析） --------------------
+def _load_dotenv():
+    # 尝试 python-dotenv
+    try:
+        from dotenv import load_dotenv, find_dotenv  # type: ignore
+        # 在 CWD 或其上层查找；找不到就用脚本目录
+        path = find_dotenv(usecwd=True)
+        if not path:
+            here = os.path.dirname(os.path.abspath(__file__))
+            cand = os.path.join(here, ".env")
+            if os.path.exists(cand):
+                path = cand
+        if path:
+            load_dotenv(path)
+            print(f"🧩 .env loaded from: {path}")
+            return
+    except Exception:
+        pass
+
+    # 轻量内置解析（当前目录 / 脚本目录）
+    for base in [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]:
+        p = os.path.join(base, ".env")
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "r") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    os.environ.setdefault(k, v)
+            print(f"🧩 .env loaded from: {p}")
+            return
+        except Exception:
+            continue
+
+_load_dotenv()
+
+# -------------------- 环境变量（按你的命名） --------------------
+# 必填
+RPC_URL = os.getenv("envRPC_URL", "http://127.0.0.1:8545")
 DB_PATH = os.getenv("DB_PATH", "mpc_index.db")
-RPC_URL = os.getenv("RPC_URL", "http://127.0.0.1:8545")
-REG_ADDR = os.getenv("REGISTRY_V2")  # 部署后的 StealthRegistryV2 地址
 
-# 修复 ABI 路径 - 匹配实际的文件结构
-ABI_PATH = os.getenv("REGISTRY_V2_ABI", "../contracts/out/StealthRegistry.sol/StealthRegistryV2.json")
+# 合约地址优先取 SINGNALBOARD（按你给的拼写），其次 SIGNALBOARD，再退 REGISTRY_V2/CONTRACT_ADDR
+_CONTRACT_ADDR_RAW = (
+    os.getenv("SINGNALBOARD")
+    or os.getenv("SIGNALBOARD")
+    or os.getenv("REGISTRY_V2")
+    or os.getenv("CONTRACT_ADDR")
+)
 
-if not REG_ADDR:
-    print("❌ REGISTRY_V2 environment variable not set!")
-    print("Please set: export REGISTRY_V2=0xYourContractAddress")
-    exit(1)
+if not _CONTRACT_ADDR_RAW:
+    print("❌ CONTRACT address not set.\n请在 .env 中设置 SINGNALBOARD=0x...（或 SIGNALBOARD/REGISTRY_V2）")
+    raise SystemExit(1)
 
-REG_ADDR = Web3.to_checksum_address(REG_ADDR)
-
-# 加载 ABI
 try:
-    # 尝试相对路径
-    if os.path.exists(ABI_PATH):
-        with open(ABI_PATH) as f:
-            contract_data = json.load(f)
-            abi = contract_data["abi"]
-    else:
-        # 尝试绝对路径
-        abs_path = os.path.join(os.path.dirname(__file__), ABI_PATH)
-        with open(abs_path) as f:
-            contract_data = json.load(f)
-            abi = contract_data["abi"]
-    print(f"✅ Loaded ABI from: {ABI_PATH}")
-except FileNotFoundError:
-    print(f"❌ ABI file not found: {ABI_PATH}")
-    print("Make sure contracts are compiled: cd contracts && forge build")
-    exit(1)
-except Exception as e:
-    print(f"❌ Error loading ABI: {e}")
-    exit(1)
+    CONTRACT_ADDR = Web3.to_checksum_address(_CONTRACT_ADDR_RAW)
+except Exception:
+    print(f"❌ 非法地址: { _CONTRACT_ADDR_RAW }")
+    raise SystemExit(1)
+
+# ABI 路径：SIGNALBOARD_ABI 优先，其次 REGISTRY_V2_ABI/CONTRACT_ABI，最后内置最小 ABI
+ABI_PATH = (
+    os.getenv("SIGNALBOARD_ABI")
+    or os.getenv("REGISTRY_V2_ABI")
+    or os.getenv("CONTRACT_ABI")
+)
+
+# -------------------- 读取 ABI（或使用内置） --------------------
+abi = None
+if ABI_PATH and os.path.exists(os.path.expanduser(ABI_PATH)):
+    ABI_PATH = os.path.expanduser(ABI_PATH)
+    try:
+        with open(ABI_PATH, "r") as f:
+            artifact = json.load(f)
+            abi = artifact.get("abi", artifact)
+    except Exception as e:
+        print(f"⚠️ 读取 ABI 失败（{ABI_PATH}）：{e}，回退到内置最小 ABI")
+        abi = None
+
+if abi is None:
+    # 内置最小 ABI（兼容 SignalBoard 与 StealthRegistryV2）
+    abi = [
+        {
+            "type":"event","name":"Signal","anonymous":False,
+            "inputs":[
+                {"indexed":True,"name":"rx","type":"bytes32"},
+                {"indexed":False,"name":"yParity","type":"bool"},
+                {"indexed":True,"name":"tag","type":"bytes32"},
+                {"indexed":False,"name":"memo","type":"bytes"}
+            ]
+        },
+        {
+            "type":"event","name":"Announce","anonymous":False,
+            "inputs":[
+                {"indexed":False,"name":"R","type":"bytes"},
+                {"indexed":False,"name":"memoCipher","type":"bytes"},
+                {"indexed":True,"name":"commitment","type":"bytes32"},
+                {"indexed":True,"name":"tag","type":"bytes32"}
+            ]
+        }
+    ]
+    ABI_PATH = "<<built-in>>"
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
-contract = w3.eth.contract(address=REG_ADDR, abi=abi)
+contract = w3.eth.contract(address=CONTRACT_ADDR, abi=abi)
 
-# 查找 Announce 事件 ABI
+# 选择事件：优先 Signal，其次 Announce
 evt_abi = None
+evt_kind = None  # "signal" | "announce"
 for item in abi:
-    if item.get("type") == "event" and item.get("name") == "Announce":
-        evt_abi = item
-        break
-
+    if item.get("type") == "event" and item.get("name") == "Signal":
+        evt_abi = item; evt_kind = "signal"; break
 if not evt_abi:
-    print("❌ Announce event ABI not found in contract")
-    print("Available events:", [item.get("name") for item in abi if item.get("type") == "event"])
-    exit(1)
+    for item in abi:
+        if item.get("type") == "event" and item.get("name") == "Announce":
+            evt_abi = item; evt_kind = "announce"; break
+if not evt_abi:
+    print("❌ ABI 中未找到 Signal/Announce 事件"); raise SystemExit(1)
 
-print(f"✅ Found Announce event ABI")
+print(f"✅ Using event: {evt_abi['name']} ({evt_kind})")
+
+# -------------------- DB helpers --------------------
+def _open_db():
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+    return con
 
 def ensure_db():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS meta(
-      k TEXT PRIMARY KEY,
-      v TEXT
-    );
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS events(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      block INTEGER,
-      txhash TEXT,
-      tag BLOB,            -- bytes32
-      R   BLOB,            -- 33B 压缩 secp256k1 公钥
-      memo BLOB,           -- 任意长度密文
-      commitment BLOB,     -- bytes32
-      scanned INTEGER DEFAULT 0,
-      matched INTEGER DEFAULT 0,
-      created_at INTEGER
-    );
-    """)
+    con = _open_db(); cur = con.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS meta(
+        k TEXT PRIMARY KEY,
+        v TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        block INTEGER,
+        txhash TEXT,
+        tag BLOB,
+        R   BLOB,
+        memo BLOB,
+        commitment BLOB,
+        scanned INTEGER DEFAULT 0,
+        matched INTEGER DEFAULT 0,
+        created_at INTEGER
+    )""")
     cur.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('last_block','0')")
-    con.commit()
-    con.close()
-    print("✅ Database tables ensured")
+    con.commit(); con.close()
+    print(f"✅ Database ready @ {os.path.abspath(DB_PATH)}")
 
-def get_last_block():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
+def get_last_block() -> int:
+    con = _open_db(); cur = con.cursor()
     cur.execute("SELECT v FROM meta WHERE k='last_block'")
-    result = cur.fetchone()
-    con.close()
-    return int(result[0]) if result else 0
+    row = cur.fetchone(); con.close()
+    return int(row[0]) if row else 0
 
 def set_last_block(h: int):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
+    con = _open_db(); cur = con.cursor()
     cur.execute("UPDATE meta SET v=? WHERE k='last_block'", (str(h),))
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
-def save_event(block, txhash, tag_bytes, R_bytes, memo_bytes, commitment_bytes):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
+def insert_event(block, txhash, R_bytes, tag_bytes, memo_bytes, commitment_bytes):
+    con = _open_db(); cur = con.cursor()
     cur.execute("""
       INSERT INTO events(block, txhash, tag, R, memo, commitment, created_at)
       VALUES(?,?,?,?,?,?, strftime('%s','now'))
     """, (block, txhash, tag_bytes, R_bytes, memo_bytes, commitment_bytes))
-    event_id = cur.lastrowid
-    con.commit()
-    con.close()
-    return event_id
+    eid = cur.lastrowid
+    con.commit(); con.close()
+    return eid
 
+def _pack_R_from_rx(rx: bytes, y_parity: bool) -> bytes:
+    return (b'\x03' if y_parity else b'\x02') + rx
+
+# -------------------- 主轮询 --------------------
 def poll_once():
     ensure_db()
     last = get_last_block()
-    
-    try:
-        tip = w3.eth.block_number
-    except Exception as e:
-        print(f"❌ Failed to get block number: {e}")
-        return
-        
-    from_block = last + 1
-    if from_block > tip:
+
+    tip = w3.eth.block_number
+    if last >= tip:
         return
 
-    # Announce 事件的 topic
-    topic = w3.keccak(text="Announce(bytes,bytes,bytes32,bytes32)").hex()
-    
+    if evt_kind == "signal":
+        topic0 = w3.keccak(text="Signal(bytes32,bool,bytes32,bytes)").hex()
+    else:
+        topic0 = w3.keccak(text="Announce(bytes,bytes,bytes32,bytes32)").hex()
+
+    start = last + 1
+    end   = min(tip, start + 4095)
+
     try:
         logs = w3.eth.get_logs({
-            "fromBlock": from_block,
-            "toBlock": tip,
-            "address": REG_ADDR,
-            "topics": [topic]
+            "fromBlock": start,
+            "toBlock": end,
+            "address": CONTRACT_ADDR,
+            "topics": [topic0]
         })
     except Exception as e:
-        print(f"❌ Failed to get logs: {e}")
+        print(f"❌ get_logs failed: {e}")
         return
 
-    print(f"📡 Scanning blocks {from_block}-{tip}, found {len(logs)} events")
+    if logs:
+        print(f"📡 blocks {start}-{end}: {len(logs)} {evt_kind} event(s)")
 
     for lg in logs:
         try:
             ed = get_event_data(w3.codec, evt_abi, lg)
-            R = ed["args"]["R"]                     # bytes
-            memo = ed["args"]["memoCipher"]         # bytes
-            commitment = ed["args"]["commitment"]   # HexBytes(32)
-            tag = ed["args"]["tag"]                 # HexBytes(32)
+            if evt_kind == "signal":
+                rx       = ed["args"]["rx"]
+                yParity  = ed["args"]["yParity"]
+                tag      = ed["args"]["tag"]
+                memo     = ed["args"]["memo"]
+                R_bytes  = _pack_R_from_rx(bytes(rx), bool(yParity))
+                commit_b = b""
+            else:
+                R_bytes  = bytes(ed["args"]["R"])
+                memo     = bytes(ed["args"]["memoCipher"])
+                commit_b = bytes(ed["args"]["commitment"])
+                tag      = ed["args"]["tag"]
 
-            event_id = save_event(
-                lg["blockNumber"],
-                lg["transactionHash"].hex(),
-                bytes(tag),
-                bytes(R),
-                bytes(memo),
-                bytes(commitment),
+            eid = insert_event(
+                lg["blockNumber"], lg["transactionHash"].hex(),
+                R_bytes, bytes(tag), memo, commit_b
             )
-            
-            print(f"✅ Saved event #{event_id} from block {lg['blockNumber']}")
-            print(f"   - R: {bytes(R).hex()[:20]}...")
-            print(f"   - tag: {bytes(tag).hex()[:20]}...")
-            
-            last = max(last, lg["blockNumber"])
-            
+            print(f"✅ saved event #{eid} @ block {lg['blockNumber']}  R={R_bytes[:2].hex()}.. tag={bytes(tag).hex()[:10]}..")
         except Exception as e:
-            print(f"❌ Error processing log: {e}")
-            continue
+            print(f"❌ decode/save error: {e}")
 
-    set_last_block(tip)
+    set_last_block(end)
 
 def main():
-    print(f"🔄 [watcher] Starting...")
-    print(f"📡 RPC: {RPC_URL}")
-    print(f"📝 Registry: {REG_ADDR}")
-    print(f"💾 Database: {DB_PATH}")
-    
-    # 检查连接
+    print("🔄 [watcher] starting…")
+    print(f"⛓️  RPC: {RPC_URL}")
+    print(f"📍 Contract: {CONTRACT_ADDR}")
+    print(f"📄 ABI: {ABI_PATH}")
+
     try:
-        if w3.is_connected():
-            chain_id = w3.eth.chain_id
-            print(f"⛓️  Connected to chain ID: {chain_id}")
-        else:
-            print("❌ RPC connection failed")
-            return
-    except Exception as e:
-        print(f"❌ RPC connection error: {e}")
-        return
-    
-    # 检查合约
-    try:
-        code = w3.eth.get_code(REG_ADDR)
+        if not w3.is_connected():
+            print("❌ RPC not connected"); return
+        code = w3.eth.get_code(CONTRACT_ADDR)
         if code == b"":
-            print(f"❌ No contract code at {REG_ADDR}")
-            print("Make sure the contract is deployed")
-            return
-        else:
-            print(f"✅ Contract verified at {REG_ADDR}")
+            print("❌ No contract code at address"); return
+        print("✅ chain_id:", w3.eth.chain_id)
     except Exception as e:
-        print(f"❌ Error checking contract: {e}")
-        return
-    
-    # 主循环
-    print("🚀 Watcher started, monitoring for events...")
+        print("❌ RPC check error:", e); return
+
+    print("🚀 watcher running…")
     while True:
         try:
             poll_once()
         except KeyboardInterrupt:
-            print("\n👋 Watcher stopped")
-            break
+            print("\n👋 watcher stopped"); break
         except Exception as e:
-            print(f"❌ [watcher] error: {e}")
-        time.sleep(2)
+            print("❌ loop error:", e)
+        time.sleep(1.5)
 
 if __name__ == "__main__":
     main()
