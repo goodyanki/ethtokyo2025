@@ -8,11 +8,13 @@
     "start": "next start"
   },
   "dependencies": {
+    "@noble/hashes": "^2.0.0",
     "bs58": "^6.0.0",
     "crypto": "^1.0.1",
     "ethers": "^6.15.0",
     "jsqr": "^1.4.0",
     "next": "15.5.3",
+    "noble-secp256k1": "^1.2.14",
     "qrcode.react": "^4.2.0",
     "react": "19.1.0",
     "react-dom": "19.1.0",
