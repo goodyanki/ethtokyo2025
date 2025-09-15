@@ -8,7 +8,7 @@ from mpc_core.shamir import shamir_split
 from mpc_core.scan import derive_tag, match_tag
 from mpc_core.crypto import ecies_decrypt_secp256k1
 
-# ---------- Web3 连接 & 合约 ----------
+# ---------- Web3 connection & contract ----------
 RPC_URL = os.getenv("RPC_URL", "http://127.0.0.1:8545")
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
 
@@ -28,14 +28,14 @@ payment_contract = w3.eth.contract(address=PAYMENT_PROXY_ADDRESS, abi=abi)
 SENDER_ADDR = Web3.to_checksum_address(os.getenv("ETH_SENDER", "0xYourAccount"))
 SENDER_PK   = os.getenv("ETH_PRIVATE_KEY", "0xYourPrivateKey")
 
-# ---------- MPC 解密配置 ----------
+# ---------- MPC decryption config ----------
 USE_MPC_DECRYPT = os.getenv("USE_MPC_DECRYPT", "true").lower() in ("1", "true", "yes")
 MPC_NODES = [x.strip() for x in os.getenv("MPC_NODES", "http://127.0.0.1:7001,http://127.0.0.1:7002,http://127.0.0.1:7003").split(",") if x.strip()]
 MPC_THRESHOLD = int(os.getenv("MPC_THRESHOLD", "2"))
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "1.5"))
 STRICT_MPC = os.getenv("STRICT_MPC", "false").lower() in ("1", "true", "yes")
 
-# 模拟解密的备用私钥
+# Backup view private key for simulated decryption
 VIEW_SK_HEX = os.getenv("VIEW_SK_HEX", None)
 
 def _hex_to_bytes(x: str) -> bytes:
@@ -58,9 +58,9 @@ def announce_onchain(tag_bytes32: bytes, R: bytes, memo: bytes):
     })
     return send_tx(tx)
 
-# -------------------- MPC 解密实现 --------------------
+# -------------------- MPC decryption implementation --------------------
 def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
-    """使用MPC节点协作进行ECIES解密"""
+    """ECIES decryption using MPC nodes"""
     import requests
     import hashlib
     from coincurve import PublicKey
@@ -68,7 +68,8 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes
     
-    # 第1步：收集ECDH分片
+    # Step 1: collect ECDH shares
+    # Reuse /scan_share endpoint since it computes Yi = share_i * R
     def _as_bytes(x) -> bytes:
         if isinstance(x, str):
             s = x.strip()
@@ -88,7 +89,6 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
     
     for url in MPC_NODES:
         try:
-            # 直接复用 /scan_share 端点，因为计算的是同一个 yi * R
             resp = requests.post(f"{url.rstrip('/')}/scan_share", json=payload, timeout=HTTP_TIMEOUT_S)
             resp.raise_for_status()
             data = resp.json()
@@ -102,7 +102,7 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
                 print(f"⚠️ bad Yi from {url}: len={len(Yi)}")
                 continue
                 
-            PublicKey(Yi)  # 验证点在曲线上
+            PublicKey(Yi)  # sanity check: point must be on curve
             shares.append((i, Yi))
             seen.add(i)
             
@@ -116,7 +116,7 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
     if len(shares) < MPC_THRESHOLD:
         raise RuntimeError(f"Not enough ECDH shares: {len(shares)}/{MPC_THRESHOLD}")
     
-    # 第2步：拉格朗日插值聚合
+    # Step 2: aggregate via Lagrange interpolation at x=0
     SECP_N = int("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
     
     def _lagrange_coeffs_at_zero(indices):
@@ -134,6 +134,7 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
         return lambdas
     
     def _point_mul(pub, k):
+        # coincurve expects 32-byte big-endian scalar
         k_bytes = (k % SECP_N).to_bytes(32, "big")
         return pub.multiply(k_bytes)
     
@@ -145,7 +146,7 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
     indices = [i for (i, _) in shares]
     lambdas = _lagrange_coeffs_at_zero(indices)
     
-    # 聚合 S = Σ λᵢ * Yᵢ = v * R
+    # Aggregate S = Σ λᵢ * Yᵢ = v * R
     S = None
     for lam, (_, Yi_bytes) in zip(lambdas, shares):
         Yi = PublicKey(Yi_bytes)
@@ -155,10 +156,10 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
     if S is None:
         raise RuntimeError("Failed to aggregate ECDH result")
     
-    # 第3步：提取共享密钥（X坐标32字节）
-    shared_secret = S.format(compressed=False)[1:33]  # 取X坐标
+    # Step 3: extract shared key = X coordinate (32 bytes)
+    shared_secret = S.format(compressed=False)[1:33]
     
-    # 第4步：HKDF派生AES密钥
+    # Step 4: derive AES key via HKDF-SHA256
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
@@ -167,7 +168,7 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
     )
     aes_key = hkdf.derive(shared_secret)
     
-    # 第5步：AES-CTR解密
+    # Step 5: AES-CTR decrypt
     iv_bytes = _as_bytes(iv_hex)
     ct_bytes = _as_bytes(ct_hex)
     
@@ -177,7 +178,7 @@ def mpc_ecies_decrypt(eph_pub_hex: str, iv_hex: str, ct_hex: str) -> bytes:
     
     return plaintext
 
-# -------------------- 主入口 --------------------
+# -------------------- Main entry --------------------
 def process_payment_request(req_json: str):
     data = json.loads(req_json)
 
@@ -187,19 +188,19 @@ def process_payment_request(req_json: str):
     checksum     = data["checksum"]
     to_addr      = Web3.to_checksum_address(data.get("to", SENDER_ADDR))
 
-    # 1) checksum 简检
+    # 1) checksum sanity check
     if not str(checksum).startswith("0x"):
         raise ValueError("Invalid checksum")
 
-    # 2) 生成选择性披露 tag（链上公告字段）
+    # 2) generate linkability tag (on-chain announcement field)
     onchain_tag_hex = derive_tag(pubkey_view, nonce)  # sha256 hex
     onchain_tag_bytes = _bytes32_align(_hex_to_bytes(onchain_tag_hex))
 
-    # 3) 轻钱包/本地匹配（demo必为真）
+    # 3) local/light-wallet matching (always true in demo)
     if not match_tag(pubkey_view, nonce, onchain_tag_hex):
         return {"status": "no_match", "message": "No transaction for this address"}
 
-    # 4) ECIES 解密金额 - MPC 或模拟
+    # 4) ECIES decryption of amount — MPC or simulated
     amount_cipher = data["amountCipher"]  # {ephPub, iv, ct} (hex)
     eph_pub = amount_cipher["ephPub"]
     iv      = amount_cipher["iv"]
@@ -220,7 +221,7 @@ def process_payment_request(req_json: str):
     except Exception as decrypt_err:
         print(f"❌ Decryption failed: {decrypt_err}")
         
-        # 回退机制（如果不是严格MPC模式）
+        # Fallback (if not strict-MPC mode)
         if USE_MPC_DECRYPT and not STRICT_MPC and VIEW_SK_HEX:
             print("🔄 Falling back to simulated decryption...")
             try:
@@ -231,21 +232,21 @@ def process_payment_request(req_json: str):
         else:
             raise ValueError(f"Decryption failed: {decrypt_err}")
 
-    # 解析解密结果
+    # Parse decrypted result
     try:
         decrypted_amount = int(pt_bytes.decode())
     except Exception:
-        # 也支持直接把明文当大端整数编码
+        # Also support interpreting plaintext as big-endian integer
         decrypted_amount = int.from_bytes(pt_bytes, "big")
 
-    # 5) Shamir 分片（3方，阈值2）
+    # 5) Shamir secret sharing (3 parties, threshold 2)
     shares = shamir_split(decrypted_amount, n=3, t=2)
 
-    # 6) 生成 secp256k1 ECDSA 签名（供合约 ecrecover）
-    MPC_ECDSA_PK = os.getenv("MPC_ECDSA_PK", SENDER_PK)  # demo：用本地私钥模拟 TSS 聚合签名者
+    # 6) Generate secp256k1 ECDSA signature (verified by contract via ecrecover)
+    MPC_ECDSA_PK = os.getenv("MPC_ECDSA_PK", SENDER_PK)  # demo: simulate TSS aggregator with local key
     mpc_account  = Account.from_key(MPC_ECDSA_PK)
 
-    # 防重放：paymentId 绑定 tag + to + amount
+    # Anti-replay: bind paymentId to (tag + to + amount)
     payment_id = Web3.keccak(text=f"{onchain_tag_hex}:{to_addr}:{decrypted_amount}")  # bytes32
     digest = Web3.solidity_keccak(
         ["bytes32", "address", "uint256", "bytes32"],
@@ -254,11 +255,11 @@ def process_payment_request(req_json: str):
     signed = Account.sign_hash(digest, private_key=MPC_ECDSA_PK)
     v, r, s = int(signed.v), Web3.to_hex(signed.r), Web3.to_hex(signed.s)
 
-    # 7) 上链公告（事件可供钱包离线后回放）
+    # 7) On-chain announcement (event can be replayed by wallets later)
     receipt_announce = announce_onchain(
         tag_bytes32=onchain_tag_bytes,
-        R=_hex_to_bytes(eph_pub),         # 可以把一次性公钥 R 也塞进公告，便于恢复
-        memo=_hex_to_bytes(ct)            # 或者放一段加密 memo
+        R=_hex_to_bytes(eph_pub),         # optionally include ephemeral R for recovery
+        memo=_hex_to_bytes(ct)            # or put an encrypted memo
     )
 
     return {
