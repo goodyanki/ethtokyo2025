@@ -39,7 +39,7 @@ export default function SendScanPage() {
   const [decoded, setDecoded] = useState<Decoded | null>(null);
   const [status, setStatus] = useState<string>("");
 
-  // 发送相关状态
+  // sending state
   const [amountEth, setAmountEth] = useState<string>("0.01");
   const [memo, setMemo] = useState<string>("");
   const [addr, setAddr] = useState<string>("");
@@ -47,9 +47,8 @@ export default function SendScanPage() {
   const [tagHex, setTagHex] = useState<string>("");
   const [txHash, setTxHash] = useState<string>("");
 
-  // 发布渠道：signal 或 announce
+  // post channel: signal or announce
   const [postMode, setPostMode] = useState<PostMode>("announce");
-
   const [busy, setBusy] = useState<null | "scan" | "derive" | "send" | "announce">(null);
 
   const stopScan = () => {
@@ -86,7 +85,7 @@ export default function SendScanPage() {
         setRawCode(qr.data);
         decodeReceiveCode(qr.data)
           .then((d) => setDecoded(d as Decoded))
-          .catch((e) => setStatus(`解码失败: ${e?.message || String(e)}`));
+          .catch((e) => setStatus(`Decode failed: ${e?.message || String(e)}`));
         return;
       }
     }
@@ -111,31 +110,31 @@ export default function SendScanPage() {
       setScanning(true);
       rafRef.current = requestAnimationFrame(tick);
     } catch (e: any) {
-      setStatus(`无法访问摄像头: ${e?.message || String(e)}`);
+      setStatus(`Camera access failed: ${e?.message || String(e)}`);
     } finally {
       setBusy(null);
     }
   };
 
-  // 第一步：基于收款码计算一次性地址与公告参数
+  // Step 1: derive one-time address and announcement params
   const deriveOnce = async () => {
     try {
       setBusy("derive");
       setStatus("");
       setAddr(""); setRhex(""); setTagHex(""); setTxHash("");
       if (!decoded) {
-        setStatus("请先扫码获取收款码");
+        setStatus("Please scan a Receive Code first.");
         return;
       }
       const spend = decoded.pubkeySpend;
       const view  = decoded.pubkeyView;
 
       if (!(spend?.startsWith("0x") && view?.startsWith("0x"))) {
-        setStatus("收款码公钥格式错误");
+        setStatus("Invalid public key format in Receive Code.");
         return;
       }
       if (spend.length !== 2 + 65 * 2 || view.length !== 2 + 33 * 2) {
-        setStatus("公钥长度不符合（需要 65B 未压 spend + 33B 压缩 view）");
+        setStatus("Invalid key length (need 65B uncompressed spend + 33B compressed view).");
         return;
       }
 
@@ -148,31 +147,31 @@ export default function SendScanPage() {
       setAddr(out.addr);
       setRhex(out.R);
       setTagHex(out.tag);
-      setStatus("已生成一次性地址与公告参数");
+      setStatus("Derived one-time address & announcement params.");
     } catch (e: any) {
-      setStatus(`派生失败: ${e?.message || String(e)}`);
+      setStatus(`Derivation failed: ${e?.message || String(e)}`);
     } finally {
       setBusy(null);
     }
   };
 
-  // 第二步：发送 ETH 到一次性地址
+  // Step 2: send ETH
   const sendEth = async () => {
     try {
       setBusy("send");
       setStatus("");
       if (!addr) {
-        setStatus("请先生成一次性地址");
+        setStatus("Please derive a one-time address first.");
         return;
       }
       if (!(window as any).ethereum) {
-        setStatus("未检测到钱包 (window.ethereum)");
+        setStatus("No wallet detected (window.ethereum).");
         return;
       }
       const provider = new BrowserProvider((window as any).ethereum);
       const accounts = await (window as any).ethereum.request({ method: "eth_requestAccounts" });
       if (!accounts || accounts.length === 0) {
-        setStatus("未连接钱包");
+        setStatus("Wallet not connected.");
         return;
       }
       const signer = await provider.getSigner();
@@ -182,32 +181,32 @@ export default function SendScanPage() {
       });
       const receipt = await tx.wait();
       setTxHash(receipt?.hash || tx.hash);
-      setStatus(`已转账到一次性地址 ${addr}`);
+      setStatus(`Payment sent to one-time address ${addr}.`);
     } catch (e: any) {
-      setStatus(`发送失败: ${e?.message || String(e)}`);
+      setStatus(`Send failed: ${e?.message || String(e)}`);
     } finally {
       setBusy(null);
     }
   };
 
-  // 第三步：把公告发给后端（根据 postMode 分流）
+  // Step 3: post announcement (Signal or Registry)
   const postAnnounce = async () => {
     try {
       setBusy("announce");
       setStatus("");
 
       if (!Rhex || !tagHex) {
-        setStatus("缺少公告参数，请先生成一次性地址");
+        setStatus("Missing announcement params. Please derive first.");
         return;
       }
       const commitment = "0x" + "00".repeat(32);
 
       if (postMode === "announce") {
-        // 走 StealthRegistryV2 的 Announce(bytes,bytes,bytes32,bytes32)
+        // Registry.Announce(bytes,bytes,bytes32,bytes32)
         const body = {
-          R: Rhex,                 // 0x.. 33B
-          tag: tagHex,             // 0x.. 32B
-          memoCipher: null as any, // 或 {ephPub, iv, ct}
+          R: Rhex,
+          tag: tagHex,
+          memoCipher: null as any,
           commitment,
           txHash: txHash || null,
         };
@@ -218,13 +217,12 @@ export default function SendScanPage() {
         });
         const j = await res.json();
         if (!res.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${res.status}`);
-        setStatus("✅ 已提交到 Registry · Announce");
+        setStatus("✅ Posted to Registry · Announce.");
       } else {
-        // 走 SignalBoard 的 Signal(bytes32,bool,bytes32,bytes)
-        // 拆 R 压缩点：prefix(0x02/0x03) + rx(32B)
+        // SignalBoard.Signal(bytes32,bool,bytes32,bytes)
         const hex = Rhex.toLowerCase();
         if (!hex.startsWith("0x") || hex.length !== 2 + 33 * 2) {
-          throw new Error("R 长度错误（需要 33B 压缩公钥）");
+          throw new Error("Invalid R length (need 33B compressed public key).");
         }
         const prefix = hex.slice(2, 4);
         const rx = "0x" + hex.slice(4);
@@ -234,7 +232,7 @@ export default function SendScanPage() {
           rx,                      // bytes32
           yParity,                 // bool
           tag: tagHex,             // bytes32
-          memo: "0x",              // 可放密文，这里简化
+          memo: "0x",              // optional ciphertext
           txHash: txHash || null,
         };
         const res = await fetch("http://127.0.0.1:8000/sender/signal", {
@@ -244,17 +242,17 @@ export default function SendScanPage() {
         });
         const j = await res.json();
         if (!res.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${res.status}`);
-        setStatus("✅ 已提交到 SignalBoard · Signal");
+        setStatus("✅ Posted to SignalBoard · Signal.");
       }
     } catch (e: any) {
-      setStatus(`公告失败: ${e?.message || String(e)}`);
+      setStatus(`Announcement failed: ${e?.message || String(e)}`);
     } finally {
       setBusy(null);
     }
   };
 
   const copy = async (txt: string) => {
-    try { await navigator.clipboard.writeText(txt); setStatus("已复制到剪贴板"); } catch {}
+    try { await navigator.clipboard.writeText(txt); setStatus("Copied to clipboard."); } catch {}
   };
 
   const Pill = ({ ok, label }: { ok: boolean; label: string }) => (
@@ -267,26 +265,26 @@ export default function SendScanPage() {
 
   return (
     <main className="relative min-h-screen bg-gradient-to-b from-white to-[#f7f9fc] text-[#0f172a]">
-      {/* 背景点缀 */}
+      {/* background accents */}
       <div className="pointer-events-none absolute -top-24 left-1/2 h-[420px] w-[620px] -translate-x-1/2 rounded-full bg-gradient-to-r from-indigo-400 via-sky-400 to-emerald-400 opacity-20 blur-3xl" />
       <div className="pointer-events-none absolute bottom-0 -left-28 h-[300px] w-[420px] rounded-full bg-gradient-to-tr from-fuchsia-400 via-pink-400 to-amber-300 opacity-20 blur-3xl" />
 
       <div className="relative mx-auto max-w-6xl px-6 py-12">
-        {/* 顶部信息 */}
+        {/* header */}
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Send · 隐匿支付</h1>
-            <p className="mt-1 text-sm text-[#64748b]">扫描收款码 → 生成一次性地址 → 钱包转账 → 提交公告</p>
+            <h1 className="text-2xl font-semibold tracking-tight">Send · Private Payment</h1>
+            <p className="mt-1 text-sm text-[#64748b]">Scan Receive Code → derive one-time address → pay → post announcement</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Pill ok={!!rawCode} label={rawCode ? "已扫码" : "未扫码"} />
-            <Pill ok={!!addr} label={addr ? "已生成地址" : "未生成地址"} />
-            <Pill ok={!!txHash} label={txHash ? "已转账" : "未转账"} />
+            <Pill ok={!!rawCode} label={rawCode ? "Scanned" : "Not scanned"} />
+            <Pill ok={!!addr} label={addr ? "Address ready" : "Not derived"} />
+            <Pill ok={!!txHash} label={txHash ? "Paid" : "Not paid"} />
           </div>
         </header>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
-          {/* 左侧：相机 & 状态 */}
+          {/* left: camera & status */}
           <div className="relative rounded-2xl border border-slate-200 bg-white/90 shadow-lg overflow-hidden">
             <div className="absolute inset-0 pointer-events-none [mask-image:radial-gradient(120%_80%_at_50%_-10%,#000_55%,transparent_85%)]">
               <div className="absolute inset-x-0 -top-20 mx-auto h-80 w-[90%] rounded-full bg-gradient-to-r from-indigo-400/20 via-sky-400/20 to-emerald-400/20 blur-2xl" />
@@ -294,7 +292,7 @@ export default function SendScanPage() {
             <div className="relative p-4 flex items-center justify-between">
               <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-600 shadow-sm">
                 <Camera className="h-3.5 w-3.5 text-slate-800" />
-                {scanning ? "扫描中…" : "未开始扫描"}
+                {scanning ? "Scanning…" : "Idle"}
               </div>
               <div className="flex items-center gap-2">
                 {!scanning ? (
@@ -304,14 +302,14 @@ export default function SendScanPage() {
                     className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-sky-500 to-sky-600 px-4 py-2 text-sm text-white shadow hover:from-sky-600 hover:to-sky-700"
                   >
                     {busy === "scan" ? <Loader2 className="h-4 w-4 animate-spin" /> : <QrCode className="h-4 w-4" />}
-                    开始扫描
+                    Start scan
                   </button>
                 ) : (
                   <button
                     onClick={stopScan}
                     className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-rose-500 to-rose-600 px-4 py-2 text-sm text-white shadow hover:from-rose-600 hover:to-rose-700"
                   >
-                    停止
+                    Stop
                   </button>
                 )}
               </div>
@@ -325,11 +323,11 @@ export default function SendScanPage() {
             )}
           </div>
 
-          {/* 右侧：步骤 & 表单 */}
+          {/* right: steps & form */}
           <div className="space-y-6">
-            {/* 识别结果 */}
+            {/* scan result */}
             <div className="rounded-2xl border border-slate-200 bg-white/90 p-4 shadow-sm">
-              <div className="mb-3 text-sm font-semibold text-slate-900">识别结果</div>
+              <div className="mb-3 text-sm font-semibold text-slate-900">Scan result</div>
               {rawCode ? (
                 <div className="space-y-3">
                   <div className="text-xs break-all bg-slate-50 p-2 rounded border border-slate-200/70">
@@ -344,19 +342,19 @@ export default function SendScanPage() {
                       <li>checksum: <span className="break-all font-mono">{decoded.checksum}</span></li>
                     </ul>
                   ) : (
-                    <div className="text-sm text-[#64748b]">正在解码…</div>
+                    <div className="text-sm text-[#64748b]">Decoding…</div>
                   )}
                 </div>
               ) : (
-                <div className="text-sm text-[#64748b]">未检测到二维码</div>
+                <div className="text-sm text-[#64748b]">No QR detected</div>
               )}
             </div>
 
-            {/* 表单 */}
+            {/* form */}
             <div className="rounded-2xl border border-slate-200 bg-white/90 p-4 shadow-sm space-y-4">
               <div className="grid sm:grid-cols-2 gap-3">
                 <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm focus-within:ring-2 focus-within:ring-sky-500">
-                  <span className="text-slate-600 w-20">金额 (ETH)</span>
+                  <span className="text-slate-600 w-20">Amount (ETH)</span>
                   <input
                     value={amountEth}
                     onChange={(e) => setAmountEth(e.target.value)}
@@ -365,19 +363,19 @@ export default function SendScanPage() {
                   />
                 </label>
                 <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm focus-within:ring-2 focus-within:ring-sky-500">
-                  <span className="text-slate-600 w-20">备注</span>
+                  <span className="text-slate-600 w-20">Memo</span>
                   <input
                     value={memo}
                     onChange={(e) => setMemo(e.target.value)}
                     className="w-full outline-none text-slate-900 placeholder:text-slate-400"
-                    placeholder="可选"
+                    placeholder="optional"
                   />
                 </label>
               </div>
 
-              {/* 渠道选择 */}
+              {/* channel */}
               <div className="flex items-center gap-3">
-                <span className="text-sm text-slate-600 w-20">发布到</span>
+                <span className="text-sm text-slate-600 w-20">Post to</span>
                 <Segmented
                   value={postMode}
                   onChange={(v) => setPostMode(v)}
@@ -388,41 +386,41 @@ export default function SendScanPage() {
                 />
               </div>
 
-              {/* 步骤按钮 */}
+              {/* steps */}
               <div className="space-y-3">
                 <Step
                   n={1}
-                  title="生成一次性地址"
-                  desc="基于收款码派生 (R, tag, addr)"
+                  title="Derive one-time address"
+                  desc="Compute (R, tag, addr) from Receive Code"
                   icon={<KeyRound className="h-5 w-5 text-slate-800" />}
                   loading={busy === "derive"}
                   disabled={!decoded}
                   onAction={deriveOnce}
-                  actionLabel="开始生成"
+                  actionLabel="Derive"
                 />
                 <Step
                   n={2}
-                  title="转账到隐匿地址"
-                  desc="使用浏览器钱包发送 ETH"
+                  title="Send to stealth address"
+                  desc="Use browser wallet to send ETH"
                   icon={<Wallet className="h-5 w-5 text-slate-800" />}
                   loading={busy === "send"}
                   disabled={!addr}
                   onAction={sendEth}
-                  actionLabel="发送"
+                  actionLabel="Send"
                 />
                 <Step
                   n={3}
-                  title="提交链上公告"
-                  desc={postMode === "announce" ? "提交 R / tag / commitment 到 Registry" : "提交 rx / yParity / tag 到 SignalBoard"}
+                  title="Post on-chain announcement"
+                  desc={postMode === "announce" ? "Post R / tag / commitment to Registry" : "Post rx / yParity / tag to SignalBoard"}
                   icon={<Megaphone className="h-5 w-5 text-slate-800" />}
                   loading={busy === "announce"}
                   disabled={!Rhex || !tagHex}
                   onAction={postAnnounce}
-                  actionLabel="发布"
+                  actionLabel="Post"
                 />
               </div>
 
-              {/* 结果展示 */}
+              {/* result */}
               {addr && (
                 <div className="mt-2 space-y-2 rounded-xl border border-slate-200 bg-gradient-to-br from-blue-50 to-purple-50 p-3 text-xs">
                   <Row label="one-time addr" value={addr} onCopy={() => copy(addr)} />
@@ -491,7 +489,7 @@ function Row({ label, value, onCopy }: { label: string; value: string; onCopy?: 
         <button
           onClick={onCopy}
           className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-700 hover:bg-slate-50"
-          title="复制"
+          title="Copy"
         >
           <Copy className="h-3.5 w-3.5" /> copy
         </button>
