@@ -118,3 +118,9 @@ def scan_share(req: ScanShareReq):
         return ScanShareResp(i=NODE_INDEX, Yi=_b2h(Yi_comp))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"point multiply failed: {e}")
+
+@app.post("/ecdh_share")
+def compute_ecdh_share(req: ScanShareReq):
+    """计算ECDH分片用于解密 - 复用scan_share的计算逻辑"""
+    # 实际上和 scan_share 计算的是同一个东西：yi * R
+    return scan_share(req)  # 直接复用现有逻辑！
